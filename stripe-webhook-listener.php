@@ -9,7 +9,7 @@ header('Content-Type: application/json');
 // --- CONFIGURATION START ---
 $perfex_api_url  = 'https://pmp.businesslabs.org/api/payments';
 // *** UPDATE: New Auth Token for PMP/Perfex ***
-$perfex_token    = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoidGVzdGFwaSIsIm5hbWUiOiJUZXN0QVBJIiwiQVBJX1RJTUUiOjE3NjU4NTk4NDd9.XjWG7ra47fwkr1k4IMaUTFISIpvEiCd_kSjI_-Q00MI';
+$perfex_token    = '_PLACEHOLDER_FOR_GITHUB_PUSH';
 $invoice_api_endpoint = 'https://pmp.businesslabs.org/api/invoices';
 
 $payment_mode_id = 'stripe';
@@ -27,8 +27,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // REPLACE WITH LIVE KEYS WHEN READY (Using User's Provided Test Key)
-$stripe_secret  = 'sk_test_PLACEHOLDER_FOR_GITHUB_PUSH';
-$webhook_secret = 'whsec_FZOrDxaVh3nIcUfm5qvnISM7ETc3W0aM';
+$stripe_secret  = '_PLACEHOLDER_FOR_GITHUB_PUSH';
+$webhook_secret = '_PLACEHOLDER_FOR_GITHUB_PUSH';
 
 $payload = @file_get_contents('php://input');
 $sig_header = $_SERVER['HTTP_STRIPE_SIGNATURE'] ?? '';
@@ -181,147 +181,52 @@ if (($type == 'checkout.session.completed' || $type == 'payment_intent.succeeded
 
     file_put_contents(__DIR__ . '/webhook_debug.log', date('Y-m-d H:i:s') . " - Metadata: " . print_r($metadata, true) . "\n", FILE_APPEND);
 
+
     // 5a. DEFERRED INVOICE CREATION HANDLER
     if (empty($invoice_id_to_use) && !empty($metadata['client_first_name'])) {
 
-        file_put_contents(__DIR__ . '/webhook_debug.log', date('Y-m-d H:i:s') . " - Entering Deferred Invoice Creation Block...\n", FILE_APPEND);
+        require_once __DIR__ . '/pmp_integration_class.php';
+        $pmp = new PmpIntegration($perfex_token);
 
-        $log_msgs = [];
-        $log_msgs[] = "Starting Deferred Invoice Creation via External API...";
+        file_put_contents(__DIR__ . '/webhook_debug.log', date('Y-m-d H:i:s') . " - Entering Deferred Invoice Creation Block (Refactored)...\n", FILE_APPEND);
 
-        // --- A. GET ALL INVOICES & FIND MAX ID ---
-        $res_get = pmp_api_request($invoice_api_endpoint, 'GET', [], $perfex_token);
+        // --- Step 1: Create Invoice ---
+        $pmp->log_step($stripe_id, '', 'create_invoice', 'pending', $metadata);
 
-        if ($res_get['code'] >= 200 && $res_get['code'] < 300) {
-            $all_invoices = json_decode($res_get['body'], true);
-            $max_id = -1;
-            $max_invoice_obj = null;
+        $invoice_res = $pmp->create_invoice($metadata, $amount);
 
-            if (is_array($all_invoices)) {
-                foreach ($all_invoices as $inv) {
-                    if (isset($inv['id']) && is_numeric($inv['id'])) {
-                        $current_id = (int)$inv['id'];
-                        if ($current_id > $max_id) {
-                            $max_id = $current_id;
-                            $max_invoice_obj = $inv;
-                        }
-                    }
-                }
-            }
+        if ($invoice_res['status']) {
+            $invoice_id_to_use = $invoice_res['invoice_id'];
+            $invoice_num_custom = $invoice_res['invoice_number'];
+            $pmp->log_step($stripe_id, '', 'create_invoice', 'success', $metadata, $invoice_res['response']);
 
-            if ($max_invoice_obj) {
-                $last_num_str = $max_invoice_obj['number'];
-                $log_msgs[] = "Found Max Invoice #: $last_num_str";
+            // --- Step 2: Add Payment ---
+            $pmp->log_step($stripe_id, '', 'add_payment', 'pending', ['invoice_id' => $invoice_id_to_use, 'amount' => $amount]);
 
-                // --- INCREMENT NUMBER ---
-                $next_valid_number = (string)((int)$last_num_str + 1);
+            $pay_res = $pmp->add_payment($invoice_id_to_use, $amount, $stripe_id);
 
-                // --- B. PREPARE POST DATA ---
-                $new_items = [];
-                if (!empty($metadata['newitems_json'])) {
-                    $new_items = json_decode($metadata['newitems_json'], true);
-                }
-
-                // Fallback / Safety
-                if (empty($new_items)) {
-                    // Create minimal item if missing
-                    $item_desc = $metadata['service_name'] ?? 'Service';
-                    $new_items = [[
-                        'description' => $item_desc,
-                        'qty' => 1,
-                        'rate' => $metadata['tool_price'] ?? 0
-                    ]];
-                }
-
-                $invoice_post_data = [
-                    'clientid'      => $metadata['customer_id'],
-                    'number'        => $next_valid_number,
-                    'date'          => date('Y-m-d'),
-                    'currency'      => 1,
-                    'newitems'      => $new_items,
-                    'allowed_payment_modes' => ["stripe"],
-                    'billing_street' => $metadata['client_website'] ?? 'Not Provided',
-                    'subtotal'      => $metadata['subtotal'],
-                    'total'         => $metadata['total'],
-                    'discount_type' => "after_tax",
-                    'discount_total' => $metadata['discount_total'],
-                    'clientnote'    => $metadata['client_note'] ?? '',
-                    'terms'         => $metadata['terms_content'] ?? '',
-                    'recurring'     => $metadata['recurring_val'],
-                    'cycles'        => $metadata['cycles_val']
-                ];
-
-                // --- C. CREATE INVOICE ---
-                $res_post = pmp_api_request($invoice_api_endpoint, 'POST', $invoice_post_data, $perfex_token);
-                $log_msgs[] = "Create Invoice Response Code: " . $res_post['code'];
-
-                $post_resp_data = json_decode($res_post['body'], true);
-
-                if (isset($post_resp_data['data']['new_invoice_id']) || (isset($post_resp_data['status']) && $post_resp_data['status'] == true)) {
-
-                    if (isset($post_resp_data['data']['new_invoice_id'])) {
-                        $invoice_id_to_use = $post_resp_data['data']['new_invoice_id'];
-                        $invoice_num_custom = $post_resp_data['data']['number'] ?? 'Unknown';
-                    } else {
-                        // Attempt to find it by number if ID not returned expressly
-                        // For now, logging error if ID missing
-                        $log_msgs[] = "WARNING: ID missing in response data, cannot proceed to payment.";
-                    }
-
-                    if (!empty($invoice_id_to_use)) {
-                        $log_msgs[] = "SUCCESS: Created Invoice ID: $invoice_id_to_use";
-
-                        // --- D. PAYMENT UPDATE (Step 2) ---
-                        $post_fields = [
-                            'invoiceid'     => $invoice_id_to_use,
-                            'amount'        => $amount,
-                            'paymentmode'   => 'stripe',
-                            'transactionid' => $stripe_id,
-                            'note'          => 'Payment via Stripe. Event: ' . $event['id']
-                        ];
-                        // If stripe_id was unknown, we still send it to record the payment attempt
-
-                        $res_pf = pmp_api_request($perfex_api_url, 'POST', $post_fields, $perfex_token);
-                        $log_msgs[] = "Perfex Payment Code: " . $res_pf['code'];
-
-                        // --- E. UPDATE STRIPE METADATA (Step 3) ---
-                        $msg = "Inv: " . ($invoice_num_custom ?? $invoice_id_to_use);
-                        $ch_str = curl_init("https://api.stripe.com/v1/payment_intents/$stripe_id");
-                        curl_setopt($ch_str, CURLOPT_RETURNTRANSFER, true);
-                        curl_setopt($ch_str, CURLOPT_USERPWD, $stripe_secret . ':');
-                        curl_setopt($ch_str, CURLOPT_POST, true);
-                        curl_setopt($ch_str, CURLOPT_POSTFIELDS, http_build_query([
-                            'description' => "Order #$stripe_id | $msg",
-                            'metadata' => ['generated_invoice_id' => $invoice_id_to_use]
-                        ]));
-                        $str_r = curl_exec($ch_str);
-                        curl_close($ch_str);
-                        $log_msgs[] = "Stripe Metadata Updated.";
-
-                        // --- F. FINAL CHECK (Step 4) ---
-                        $res_final = pmp_api_request($invoice_api_endpoint . '/' . $invoice_id_to_use, 'GET', [], $perfex_token);
-                        $log_msgs[] = "Final Status Check Code: " . $res_final['code'];
-                    } else {
-                        $log_msgs[] = "ERROR: Invoice ID not found in Creation Response.";
-                    }
-                } else {
-                    $log_msgs[] = "ERROR: Create Invoice Failed. Body: " . substr($res_post['body'], 0, 200);
-                }
+            if ($pay_res['status']) {
+                $pmp->log_step($stripe_id, '', 'add_payment', 'success', null, $pay_res['response']);
             } else {
-                $log_msgs[] = "ERROR: Max Invoice Object Not Found.";
+                $pmp->log_step($stripe_id, '', 'add_payment', 'failed', null, $pay_res['response'], $pay_res['error']);
             }
-        } else {
-            $log_msgs[] = "ERROR: Fetch Invoices Failed. Code: " . $res_get['code'];
-        }
 
-        // Log results to DB
-        $log_combined = implode(" | ", $log_msgs);
-
-        if (function_exists('mysql_query') && function_exists('mysql_real_escape_string')) {
-            $log_safe = mysql_real_escape_string($log_combined);
-            mysql_query("UPDATE bdgs_stripe_logs SET payload = CONCAT(payload, '\n\nLOG: $log_safe') WHERE stripe_id = '$stripe_id' ORDER BY id DESC LIMIT 1");
+            // --- Step 3: Update Stripe ---
+            $pmp->log_step($stripe_id, '', 'update_stripe', 'pending');
+            $msg = "Inv: " . ($invoice_num_custom ?? $invoice_id_to_use);
+            $ch_str = curl_init("https://api.stripe.com/v1/payment_intents/$stripe_id");
+            curl_setopt($ch_str, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch_str, CURLOPT_USERPWD, $stripe_secret . ':');
+            curl_setopt($ch_str, CURLOPT_POST, true);
+            curl_setopt($ch_str, CURLOPT_POSTFIELDS, http_build_query([
+                'description' => "Order #$stripe_id | $msg",
+                'metadata' => ['generated_invoice_id' => $invoice_id_to_use]
+            ]));
+            $str_r = curl_exec($ch_str);
+            curl_close($ch_str);
+            $pmp->log_step($stripe_id, '', 'update_stripe', 'success', null, $str_r);
         } else {
-            file_put_contents(__DIR__ . '/webhook_debug.log', date('Y-m-d H:i:s') . " - END LOG: $log_combined\n", FILE_APPEND);
+            $pmp->log_step($stripe_id, '', 'create_invoice', 'failed', $metadata, $invoice_res['response'], $invoice_res['error']);
         }
     }
 }

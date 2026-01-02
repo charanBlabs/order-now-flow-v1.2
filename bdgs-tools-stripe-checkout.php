@@ -6,7 +6,7 @@
  */
 header('Content-Type: application/json');
 
-$stripe_secret = 'rk_live_PLACEHOLDER_FOR_GITHUB_PUSH';
+$stripe_secret = '_PLACEHOLDER_FOR_GITHUB_PUSH';
 
 try {
     $data = json_decode(file_get_contents('php://input'), true);

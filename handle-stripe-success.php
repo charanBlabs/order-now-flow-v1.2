@@ -8,7 +8,7 @@ session_start();
  * Description: Handles both one-time and subscription Stripe payments inside BD.
  */
 
-$stripe_secret = 'rk_live_PLACEHOLDER_FOR_GITHUB_PUSH';
+$stripe_secret = '_PLACEHOLDER_FOR_GITHUB_PUSH';
 
 // --- Validate Input ---
 //$session_id = $pars[5];

@@ -9,7 +9,7 @@
 
 header('Content-Type: text/html; charset=UTF-8');
 
-$stripe_secret = 'rk_live_PLACEHOLDER_FOR_GITHUB_PUSH';
+$stripe_secret = '_PLACEHOLDER_FOR_GITHUB_PUSH';
 $session_id = isset($_GET['sid']) ? trim($_GET['sid']) : '';
 
 if ($session_id == '') {
